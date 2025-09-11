@@ -88,7 +88,7 @@ services:
       - spark-master
     environment:
       - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark_master:7077
+      - SPARK_MASTER_URL=spark://spark-master:7077
     networks:
       - data_eng_network
 
