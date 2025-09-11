@@ -1,17 +1,108 @@
-# docker-compose.yml
-version: '3.8'
 services:
+  # 1. 데이터베이스 (Data Warehouse / Gold Layer)
+  # 최종 처리된 데이터를 저장하고 외부 서비스에 제공하는 역할을 합니다.
   postgres_db:
     image: postgres:13
-    # latest 대신 13을 명시한 이유는 '재현성' 보장을 위해서.
+    # 'latest' 대신 특정 버전(13)을 명시하여, 언제 어디서 실행하든
+    # 동일한 환경을 보장하는 '재현성'을 확보하는 것이 매우 중요합니다.
     container_name: postgres_db
     environment:
-      # 외부에서 설정을 주입하는 방법 (환경변수와 같음)
-      # 설정 정보를 코드와 분리하는건 'Twelve-Factor App' 방법론의 핵심 원칙 중 하나.
+      # 설정 정보를 코드와 분리하는 것은 'Twelve-Factor App' 방법론의 핵심 원칙 중 하나입니다.
+      # 이렇게 하면 민감한 정보를 코드에 하드코딩하지 않고 유연하게 관리할 수 있습니다.
       - POSTGRES_USER=airflow
       - POSTGRES_PASSWORD=airflow
       - POSTGRES_DB=airflow
     volumes:
+      # 컨테이너가 삭제되어도 데이터는 영구적으로 보존됩니다.
       - postgres_data:/var/lib/postgresql/data
     ports:
+      # 로컬 PC의 5432 포트와 컨테이너의 5432 포트를 연결하여
+      # DBeaver 같은 외부 DB 툴로 접속할 수 있게 합니다.
       - "5432:5432"
+    networks:
+      - data_eng_network
+
+  # 2. 객체 스토리지 (Data Lake / Bronze & Silver Layers)
+  # 원본 데이터와 1차 가공된 데이터를 저장하는 거대한 저장소입니다.
+  minio_storage:
+    image: minio/minio:latest # 'lastest' -> 'latest' 오타 수정
+    container_name: minio_storage
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      # Spark, Python 스크립트 등이 데이터에 접근할 때 사용하는 API 포트
+      - "9000:9000"
+      # 웹 브라우저로 MinIO에 접속하여 버킷이나 파일을 관리할 때 사용하는 콘솔 포트
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - data_eng_network
+
+  # 3. 워크플로우 오케스트레이터 (Control Tower)
+  # 전체 데이터 파이프라인의 실행, 스케줄링, 모니터링을 지휘합니다.
+  airflow-webserver:
+    image: apache/airflow:2.8.1
+    container_name: airflow_webserver
+    command: webserver
+    depends_on:
+      - postgres_db
+      # Airflow는 자신의 모든 작업 기록(메타데이터)을 DB에 저장합니다.
+      # DB가 준비되기 전에 Airflow가 실행되면 에러가 발생하므로,
+      # 'depends_on'으로 서비스 실행 순서를 명확히 지정합니다.
+    ports:
+      - "8080:8080"
+    volumes:
+      # 로컬 PC의 dags 폴더와 컨테이너 내부를 실시간으로 동기화하여
+      # 로컬에서 DAG 파일을 수정하면 즉시 Airflow UI에 반영되게 합니다.
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres_db:5432/airflow
+    networks:
+      # Airflow가 postgres_db, spark-master 등 다른 서비스와 통신하려면
+      # 반드시 동일한 네트워크에 속해 있어야 합니다.
+      - data_eng_network
+
+  # 4. 분산 처리 엔진 (Data Processing Engine)
+  # 대용량 데이터를 병렬로 처리하여 변환(Transform)하는 역할을 담당합니다.
+  spark-master:
+    image: bitnami/spark:3.5
+    container_name: spark_master
+    environment:
+      - SPARK_MODE=master
+    ports:
+      - "8081:8080" # Spark Master Web UI (로컬 8080은 Airflow가 사용하므로 8081로 변경)
+      - "7077:7077"  # Worker 노드 및 애플리케이션이 Master와 통신하는 포트
+    networks:
+      - data_eng_network
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    container_name: spark_worker
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark_master:7077
+    networks:
+      - data_eng_network
+
+# --- 최상위 블록 정의 ---
+# 아래 블록들은 services: 와 동일한 레벨(들여쓰기 없음)에 위치해야 합니다.
+
+# 5. 가상 네트워크 정의
+# 여기에 정의된 서비스들이 서로 이름으로 통신할 수 있는 격리된 공간을 만듭니다.
+networks:
+  data_eng_network:
+    driver: bridge
+
+# 6. 영구 저장소(볼륨) 정의
+# 컨테이너가 사라져도 데이터를 보존하기 위해 사용할 볼륨들을 명시적으로 선언합니다.
+volumes:
+  postgres_data:
+  minio_data:
